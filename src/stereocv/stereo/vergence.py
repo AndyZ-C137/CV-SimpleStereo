@@ -141,9 +141,9 @@ def estimate_vergence_shift_px(
 
 # Overlap cropping utilities
 def apply_horizontal_shift(
-    pano_bgr: np.ndarray,
-    *,
-    shift_px: int,
+        pano_bgr: np.ndarray,
+        *,
+        shift_px: int,
 ) -> np.ndarray:
     """
     Apply a constant horizontal shift to a panorama.
@@ -177,10 +177,10 @@ def apply_horizontal_shift(
 
 
 def crop_valid_overlap(
-    left_pan_bgr: np.ndarray,
-    right_pan_shifted_bgr: np.ndarray,
-    *,
-    shift_px: int,
+        left_pan_bgr: np.ndarray,
+        right_pan_shifted_bgr: np.ndarray,
+        *,
+        shift_px: int,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Crop left and (shifted) right panoramas to their valid overlap region.
@@ -222,11 +222,11 @@ def crop_valid_overlap(
 
 
 def align_and_crop_pair(
-    left_raw_bgr: np.ndarray,
-    right_raw_bgr: np.ndarray,
-    *,
-    max_shift: int = 200,
-    far_region: str = "top_half",
+        left_raw_bgr: np.ndarray,
+        right_raw_bgr: np.ndarray,
+        *,
+        max_shift: int = 200,
+        far_region: str = "top_half",
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     Wrapper:

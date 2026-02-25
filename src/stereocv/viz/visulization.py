@@ -6,6 +6,7 @@ Visualization utilities for stereo panoramas / stereo pairs.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict
@@ -131,7 +132,7 @@ def show_and_save_anaglyph(
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(output_path), anaglyph)
-        print(f"\n[saved] {output_path}")
+        # print(f"[saved] {output_path}")
 
     return anaglyph
 
@@ -260,14 +261,134 @@ def draw_status_text(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
 
     out = img_bgr.copy()
     x0, y0 = 10, 25
-    dy = 22
+    dy = 40
 
     for i, text in enumerate(lines):
         y = y0 + i * dy
         cv2.putText(out, text, (x0, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                     (0, 0, 0), 3, cv2.LINE_AA)   # shadow
         cv2.putText(out, text, (x0, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 255, 0), 2, cv2.LINE_AA)
     return out
+
+
+def render_planar_view_from_cylinder(
+        pano_bgr: np.ndarray,
+        *,
+        yaw_deg: float,
+        fov_deg: float = 60.0,
+        panorama_fov_deg: float = 180.0,
+        out_w: int = 960,
+        out_h: int | None = None,
+) -> np.ndarray:
+    """
+    Render a rectilinear (pinhole) view from a cylindrical panorama.
+
+    our panoramas do NOT cover full 360 degrees.
+    So we must NOT assume u in [0,W) maps to theta in [0, 2*pi).
+
+    Instead, assume the panorama covers `panorama_fov_deg` degrees total.
+
+    Coordinate conventions:
+    - Panorama horizontal coordinate u ∈ [0, W)
+      maps to angle theta ∈ [-panorama_fov/2, +panorama_fov/2].
+    - yaw_deg is the virtual camera look direction relative to panorama center.
+      yaw_deg = 0 means looking at the panorama center.
+      yaw_deg = -panorama_fov/2 means looking at left edge.
+      yaw_deg = +panorama_fov/2 means looking at right edge.
+    - fov_deg is the virtual camera horizontal field of view.
+    """
+    if pano_bgr is None or pano_bgr.size == 0:
+        return pano_bgr
+
+    H, W = pano_bgr.shape[:2]
+    if out_h is None:
+        out_h = H
+
+    # Convert degrees -> radians
+    yaw = math.radians(float(yaw_deg))
+    fov = math.radians(float(fov_deg))
+    pano_fov = math.radians(float(panorama_fov_deg))
+
+    # Virtual camera focal length (pixels)
+    cx = (out_w - 1) * 0.5
+    f = cx / math.tan(fov * 0.5)
+
+    # Precompute angle offsets alpha for each output column x
+    xs = (np.arange(out_w, dtype=np.float32) - cx)
+    alpha = np.arctan(xs / float(f)).astype(np.float32)  # per-column angle offset
+
+    # Total ray angle for each column, relative to panorama center
+    theta = (yaw + alpha).astype(np.float32)
+
+    # Clamp theta to the panorama angular support:
+    # only have pano pixels for angles within [-pano_fov/2, +pano_fov/2].
+    half = np.float32(0.5 * pano_fov)
+    theta = np.clip(theta, -half, +half)
+
+    # Map theta -> panorama u in [0, W)
+    # theta = -half => u=0
+    # theta = +half => u=W-1 (approximately)
+    u = ((theta + half) / np.float32(pano_fov)) * np.float32(W - 1)
+
+    # Build remap grids
+    map_x = np.zeros((out_h, out_w), dtype=np.float32)
+    map_y = np.zeros((out_h, out_w), dtype=np.float32)
+
+    map_x[:, :] = u[None, :]
+
+    # Vertical mapping: direct y, or scale if out_h != H
+    if out_h == H:
+        map_y[:, :] = np.arange(out_h, dtype=np.float32)[:, None]
+    else:
+        ys = (np.arange(out_h, dtype=np.float32) * (H / float(out_h))).astype(np.float32)
+        map_y[:, :] = ys[:, None]
+
+    view = cv2.remap(
+        pano_bgr,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
+    return view
+
+
+def draw_correspondence_arrows(
+        frame_bgr: np.ndarray,
+        pts0: np.ndarray,
+        pts1: np.ndarray,
+        inliers: np.ndarray | None,
+        *,
+        max_draw: int = 80,
+) -> np.ndarray:
+    """
+    Draw motion arrows pts0 -> pts1 on a frame.
+    - inliers==True : green arrows
+    - inliers==False: red arrows
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return frame_bgr
+
+    vis = frame_bgr.copy()
+    n = min(int(pts0.shape[0]), int(pts1.shape[0]), int(max_draw))
+
+    for i in range(n):
+        x0, y0 = float(pts0[i, 0]), float(pts0[i, 1])
+        x1, y1 = float(pts1[i, 0]), float(pts1[i, 1])
+
+        p0 = (int(round(x0)), int(round(y0)))
+        p1 = (int(round(x1)), int(round(y1)))
+
+        ok = True
+        if inliers is not None and i < len(inliers):
+            ok = bool(inliers[i])
+
+        color = (0, 255, 0) if ok else (0, 0, 255)  # green=inlier, red=outlier
+
+        cv2.arrowedLine(vis, p0, p1, color, 1, tipLength=0.25)
+        cv2.circle(vis, p1, 2, color, -1)
+
+    return vis

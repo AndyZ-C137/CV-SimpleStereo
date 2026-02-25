@@ -3,65 +3,138 @@ from typing import Tuple, Optional
 import cv2
 import numpy as np
 from pathlib import Path
+from dataclasses import dataclass
 
 from stereocv.peleg import PelegStereoConfig, PelegStereo
 from stereocv.stabilize import StablePelegPipeline, StablePelegConfig
 
 from stereocv.stereo.vergence import align_and_crop_pair
-from stereocv.stereo.validation import run_epipolar_validation_report, draw_top_matches_with_row_info
+from stereocv.stereo.validation import run_epipolar_validation_report, draw_top_matches_with_row_info, \
+    summarize_row_band
 from stereocv.viz.visulization import (
-    resize_for_display,
-    show_and_save_anaglyph,
-    show_and_save_epipolar_overlay, draw_status_text, make_side_by_side, make_anaglyph,
+    resize_for_display, show_and_save_anaglyph, show_and_save_epipolar_overlay,
+    draw_status_text, make_side_by_side, make_anaglyph, render_planar_view_from_cylinder, draw_correspondence_arrows
 )
 
-def draw_correspondence_arrows(
-        frame_bgr: np.ndarray,
-        pts0: np.ndarray,
-        pts1: np.ndarray,
-        inliers: np.ndarray | None,
+
+def build_panoramas(
+        video_path: str | Path,
+        cfg: PelegStereoConfig,
         *,
-        max_draw: int = 80,
-) -> np.ndarray:
+        stabilized: bool,
+        show_progress: bool,
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if stabilized:
+        return run_prerecorded_video(video_path, cfg, show_progress=show_progress)
+    return run_prerecorded_video_raw(video_path, cfg, show_progress=show_progress)
+
+
+@dataclass
+class PreparedStereo:
+    # raw panoramas
+
+    left_raw: np.ndarray
+    right_raw: np.ndarray
+
+    # aligned/cropped panoramas (after vergence horizontal shift)
+    left: np.ndarray
+    right: np.ndarray
+    shift_px: int
+
+    stabilized: bool
+    video_path: Path
+
+
+def prepare_stereo_pair(
+        video_path: str | Path,
+        cfg: PelegStereoConfig,
+        *,
+        stabilized: bool,
+        show_build_process: bool = False,
+        max_shift: int = 200,
+) -> Optional[PreparedStereo]:
     """
-    Draw motion arrows pts0 -> pts1 on a frame.
-    - inliers==True : green arrows
-    - inliers==False: red arrows
+    Build L/R cylindrical panoramas (raw or stabilized) and apply vergence alignment.
+    Returns PreparedStereo or None if panoramas could not be produced.
     """
-    if frame_bgr is None or frame_bgr.size == 0:
-        return frame_bgr
+    left_raw, right_raw = build_panoramas(
+        video_path=Path(video_path),
+        cfg=cfg,
+        stabilized=stabilized,
+        show_progress=show_build_process,
+    )
 
-    vis = frame_bgr.copy()
-    n = min(int(pts0.shape[0]), int(pts1.shape[0]), int(max_draw))
+    if left_raw is None or right_raw is None:
+        return None
 
-    for i in range(n):
-        x0, y0 = float(pts0[i, 0]), float(pts0[i, 1])
-        x1, y1 = float(pts1[i, 0]), float(pts1[i, 1])
+    # Vergence alignment
+    left, right, shift_px = align_and_crop_pair(left_raw, right_raw, max_shift=max_shift)
 
-        p0 = (int(round(x0)), int(round(y0)))
-        p1 = (int(round(x1)), int(round(y1)))
+    return PreparedStereo(
+        left_raw=left_raw,
+        right_raw=right_raw,
+        left=left,
+        right=right,
+        shift_px=shift_px,
+        stabilized=stabilized,
+        video_path=Path(video_path),
+    )
 
-        ok = True
-        if inliers is not None and i < len(inliers):
-            ok = bool(inliers[i])
 
-        color = (0, 255, 0) if ok else (0, 0, 255)  # green=inlier, red=outlier
+def analyze_cylindrical_pair(
+        stereo: PreparedStereo,
+        *,
+        out_dir: Path | None,
+        tag: str,
+        cfg: PelegStereoConfig,
+        show: bool,
+        save: bool,
+) -> dict:
 
-        cv2.arrowedLine(vis, p0, p1, color, 1, tipLength=0.25)
-        cv2.circle(vis, p1, 2, color, -1)
+    left = stereo.left
+    right = stereo.right
 
-    return vis
+    # Epipolar validation
+    report = run_epipolar_validation_report(left, right, band=4, max_shift=150, max_matches=200)
 
-def summarize_row_band(row_band: list[dict]) -> tuple[float, float]:
-    """
-    Given row_band = [{"y":..., "best_dy":..., "best_dx":...}, ...]
-    return:
-      mean_abs_dy, max_abs_dy
-    """
-    if not row_band:
-        return float("nan"), float("nan")
-    dys = np.array([float(r["best_dy"]) for r in row_band], dtype=np.float64)
-    return float(np.mean(np.abs(dys))), float(np.max(np.abs(dys)))
+    # # Overlays + match visulization
+    # show_and_save_epipolar_overlay(
+    #     left, right,
+    #     out_dir=out_dir if save else None,
+    #     prefix=tag,
+    #     num_lines=8,
+    #     display_scale=cfg.display_scale,
+    #     show=show,
+    # )
+
+    match_vis = draw_top_matches_with_row_info(left, right, max_draw=20)
+    if show:
+        cv2.imshow(f"Top Matches ({tag})", resize_for_display(match_vis, cfg.display_scale))
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    if save and out_dir is not None:
+        cv2.imwrite(str(out_dir / f"{tag}_left_raw.png"), stereo.left_raw)
+        cv2.imwrite(str(out_dir / f"{tag}_right_raw.png"), stereo.right_raw)
+        cv2.imwrite(str(out_dir / f"{tag}_left.png"), left)
+        cv2.imwrite(str(out_dir / f"{tag}_right.png"), right)
+        cv2.imwrite(str(out_dir / f"{tag}_orb_matches_dy.png"), match_vis)
+
+        show_and_save_anaglyph(
+            left, right,
+            output_path=out_dir / f"{tag}_anaglyph.png",
+            display_scale=cfg.display_scale,
+            show=show,
+        )
+
+    return {
+        "left": left,
+        "right": right,
+        "shift_px": stereo.shift_px,
+        "report": report,
+        "match_vis": match_vis,
+    }
+
 
 def run_prerecorded_video(
         video_path: str | Path,
@@ -91,6 +164,9 @@ def run_prerecorded_video(
     corr_abs_sum = 0.0
     corr_abs_max = 0.0
     corr_count = 0
+
+    left_pan = None
+    right_pan = None
 
     # Create stabilized Peleg pipeline
     pipe = StablePelegPipeline(
@@ -165,7 +241,7 @@ def run_prerecorded_video(
         stable_vis = draw_status_text(stable_frame, lines)
 
         if show_progress:
-            cv2.imshow("Input Frame", resize_for_display(frame_vis, cfg.display_scale))
+            # cv2.imshow("Input Frame", resize_for_display(frame_vis, cfg.display_scale))
             cv2.imshow("Stabilized Frame", resize_for_display(stable_vis, cfg.display_scale))
 
             if left_pan is not None:
@@ -181,9 +257,9 @@ def run_prerecorded_video(
     cv2.destroyAllWindows()
 
     if corr_count > 0:
-        print(f"\n[stabilizer] mean|corr_ty|={corr_abs_sum / corr_count:.3f}px, max|corr_ty|={corr_abs_max:.3f}px")
+        print(f"\n[STABILIZED] mean|corr_ty|={corr_abs_sum / corr_count:.3f}px, max|corr_ty|={corr_abs_max:.3f}px")
     else:
-        print("\n[stabilizer] no corr_ty stats collected (no frames / no stabilization info)")
+        print("\n[STABILIZED] no corr_ty stats collected (no frames / no stabilization info)")
 
     return left_pan, right_pan
 
@@ -234,51 +310,158 @@ def run_prerecorded_video_raw(
     cv2.destroyAllWindows()
     return left_pan, right_pan
 
+#
+# def show_planar_view(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
+#     cv2.destroyAllWindows()
+#     # Render planar perspective views
+#     yaw_deg = 0.0   # center look direction
+#     fov_deg = 60.0
+#     pano_fov_deg = 200
+#
+#     for i, video_path in enumerate(VIDEO_PATHs):
+#         stereo = prepare_stereo_pair(video_path, cfg, stabilized=True, show_build_process=False)
+#         if stereo is None:
+#             print("No panoramas produced.")
+#             continue
+#
+#         while True:
+#             Lp = render_planar_view_from_cylinder(
+#                 stereo.left, yaw_deg=yaw_deg, fov_deg=fov_deg,
+#                 panorama_fov_deg=pano_fov_deg, out_w=960,
+#             )
+#             Rp = render_planar_view_from_cylinder(
+#                 stereo.right, yaw_deg=yaw_deg, fov_deg=fov_deg,
+#                 panorama_fov_deg=pano_fov_deg, out_w=960,
+#             )
+#
+#             cv2.imshow("Planar Stereo (L|R)", resize_for_display(make_side_by_side(Lp, Rp), cfg.display_scale))
+#             # cv2.imshow("Planar Anaglyph", resize_for_display(make_anaglyph(Lp, Rp), cfg.display_scale))
+#
+#             key = cv2.waitKey(30) & 0xFF
+#             if key in (27, ord("q")):
+#                 cv2.destroyAllWindows()
+#                 break
+#             if key == ord("a"):
+#                 yaw_deg -= 2.0
+#             elif key == ord("d"):
+#                 yaw_deg += 2.0
+#             elif key == ord("w"):
+#                 fov_deg = min(100.0, fov_deg + 2.0)
+#             elif key == ord("s"):
+#                 fov_deg = max(20.0, fov_deg - 2.0)
 
-def compare_stablization(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
+def show_planar_view(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
+    # Close any lingering windows so key focus is clean
+    cv2.destroyAllWindows()
+
+    yaw_deg = 0.0
+    fov_deg = 60.0
+    pano_fov_deg = 180
+
+    for i, video_path in enumerate(VIDEO_PATHs):
+        stereo = prepare_stereo_pair(video_path, cfg, stabilized=True, show_build_process=False)
+        if stereo is None:
+            print("No panoramas produced.")
+            continue
+
+        while True:
+            Lp = render_planar_view_from_cylinder(
+                stereo.left, yaw_deg=yaw_deg, fov_deg=fov_deg,
+                panorama_fov_deg=pano_fov_deg, out_w=960,
+            )
+            Rp = render_planar_view_from_cylinder(
+                stereo.right, yaw_deg=yaw_deg, fov_deg=fov_deg,
+                panorama_fov_deg=pano_fov_deg, out_w=960,
+            )
+
+            # HUD lines (on-image text)
+            hud_lines = [
+                f"yaw={yaw_deg:+.1f} deg",
+                f"fov={fov_deg:.1f} deg",
+                f"pano_fov={pano_fov_deg:.0f} deg",
+                "WASD: yaw/fov   q/ESC: quit",
+            ]
+
+            # view = make_side_by_side(Lp, Rp)
+            # cv2.imshow("Planar Stereo (L|R)", resize_for_display(view, cfg.display_scale))
+            ana = make_anaglyph(Lp, Rp)
+            ana_vis = draw_status_text(ana, hud_lines)
+            cv2.imshow("Planar Anaglyph", resize_for_display(ana_vis, cfg.display_scale))
+            key = cv2.waitKey(30) & 0xFF
+
+            if key in (27, ord("q")):
+                cv2.destroyAllWindows()
+                break
+
+            if key == ord("a"):
+                yaw_deg -= 2.0
+                # print(f"[viewer] yaw={yaw_deg:.1f}  fov={fov_deg:.1f}")
+            elif key == ord("d"):
+                yaw_deg += 2.0
+                # print(f"[viewer] yaw={yaw_deg:.1f}  fov={fov_deg:.1f}")
+            elif key == ord("w"):
+                fov_deg = min(100.0, fov_deg + 2.0)
+                # print(f"[viewer] yaw={yaw_deg:.1f}  fov={fov_deg:.1f}")
+            elif key == ord("s"):
+                fov_deg = max(20.0, fov_deg - 2.0)
+                # print(f"[viewer] yaw={yaw_deg:.1f}  fov={fov_deg:.1f}")
+
+
+def compare_stabilization(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
     for i, video_path in enumerate(VIDEO_PATHs):
         out_dir = Path(f"outputs{i}")
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        left_raw0, right_raw0 = build_panoramas(video_path, cfg, stabilized=False, show_progress=False)
-        left_raw1, right_raw1 = build_panoramas(video_path, cfg, stabilized=True, show_progress=False)
+        original = prepare_stereo_pair(video_path, cfg, stabilized=False, show_build_process=False)
+        stabilized = prepare_stereo_pair(video_path, cfg, stabilized=True, show_build_process=False)
 
-        if None in (left_raw0, right_raw0, left_raw1, right_raw1):
+        if original is None or stabilized is None:
             print("No panoramas produced for one of the runs.")
             continue
 
-        raw = process_panorama_pair(left_raw0, right_raw0, out_dir=out_dir, tag="raw", cfg=cfg, show=False, save=True)
-        stb = process_panorama_pair(left_raw1, right_raw1, out_dir=out_dir, tag="stabilized", cfg=cfg, show=False, save=True)
+        res_original = analyze_cylindrical_pair(original, out_dir=out_dir, tag="raw", cfg=cfg, show=False, save=True)
+        res_stabilized = analyze_cylindrical_pair(stabilized, out_dir=out_dir, tag="stabilized", cfg=cfg, show=False, save=True)
+
+        ori_left = res_original['left']
+        ori_right = res_original['right']
+        stab_left = res_stabilized['left']
+        stab_right = res_stabilized['right']
 
         # summaries
-        m0, M0 = summarize_row_band(raw["report"]["row_band"])
-        m1, M1 = summarize_row_band(stb["report"]["row_band"])
-        orb0 = raw["report"]["orb"]
-        orb1 = stb["report"]["orb"]
+        m0, M0 = summarize_row_band(res_original["report"]["row_band"])
+        m1, M1 = summarize_row_band(res_stabilized["report"]["row_band"])
+        orb0 = res_original["report"]["orb"]
+        orb1 = res_stabilized["report"]["orb"]
 
-        print(f"[RAW]        vergence shift: {raw['shift_px']}")
-        print(f"[STABILIZED] vergence shift: {stb['shift_px']}")
-        print(f"[RAW row-band]  mean|dy|={m0:.2f}px  max|dy|={M0:.2f}px")
-        print(f"[STB row-band]  mean|dy|={m1:.2f}px  max|dy|={M1:.2f}px")
-        print(f"[RAW ORB]        median|dy|={orb0['median_abs_dy']:.2f}px  mean|dy|={orb0['mean_abs_dy']:.2f}px  max|dy|={orb0['max_abs_dy']:.2f}px")
-        print(f"[STAB ORB]       median|dy|={orb1['median_abs_dy']:.2f}px  mean|dy|={orb1['mean_abs_dy']:.2f}px  max|dy|={orb1['max_abs_dy']:.2f}px")
+        print(f"[ORI]  vergence shift: {res_original['shift_px']}")
+        print(f"[STAB] vergence shift: {res_stabilized['shift_px']}")
+        print(f"\n[ORI row-band]  mean|dy|={m0:.2f}px  max|dy|={M0:.2f}px")
+        print(f"[STAB row-band] mean|dy|={m1:.2f}px  max|dy|={M1:.2f}px")
+        print(f"\n[ORI ORB]  median|dy|={orb0['median_abs_dy']:.2f}px  mean|dy|={orb0['mean_abs_dy']:.2f}px  max|dy|={orb0['max_abs_dy']:.2f}px")
+        print(f"[STAB ORB] median|dy|={orb1['median_abs_dy']:.2f}px  mean|dy|={orb1['mean_abs_dy']:.2f}px  max|dy|={orb1['max_abs_dy']:.2f}px")
 
         # comparisons
-        cv2.imwrite(str(out_dir / "compare_left_raw_vs_stab.png"), make_side_by_side(raw["left"], stb["left"]))
-        cv2.imwrite(str(out_dir / "compare_right_raw_vs_stab.png"), make_side_by_side(raw["right"], stb["right"]))
+        cv2.imwrite(str(out_dir / "compare_left_raw_vs_stab.png"),
+                    make_side_by_side(ori_left, stab_left))
+        cv2.imwrite(str(out_dir / "compare_right_raw_vs_stab.png"),
+                    make_side_by_side(ori_right, stab_right))
         cv2.imwrite(str(out_dir / "compare_anaglyph_raw_vs_stab.png"), make_side_by_side(
-            make_anaglyph(raw["left"], raw["right"]),
-            make_anaglyph(stb["left"], stb["right"]),
+            make_anaglyph(ori_left, ori_right),
+            make_anaglyph(stab_left, stab_right),
         ))
 
-        # optional quick view
-        cv2.imshow("RAW vs STABILIZED (Left panoramas)", resize_for_display(make_side_by_side(raw["left"], stb["left"]), cfg.display_scale))
-        cv2.imshow("RAW vs STABILIZED (Anaglyphs)", resize_for_display(make_side_by_side(
-            make_anaglyph(raw["left"], raw["right"]),
-            make_anaglyph(stb["left"], stb["right"])
+        cv2.imshow("RAW vs STABILIZED (Left panoramas)", resize_for_display(
+            make_side_by_side(ori_left, stab_left), cfg.display_scale))
+        cv2.imshow("RAW vs STABILIZED (Right panoramas)", resize_for_display(
+            make_side_by_side(ori_right, stab_right), cfg.display_scale))
+        cv2.imshow("RAW vs STABILIZED (Anaglyphs)", resize_for_display(
+            make_side_by_side(
+            make_anaglyph(ori_left, ori_right),
+            make_anaglyph(stab_left, stab_right)
         ), cfg.display_scale))
         cv2.waitKey(0)
         cv2.destroyAllWindows()
+
 
 def generate_panorama(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
     for i, video_path in enumerate(VIDEO_PATHs):
@@ -286,13 +469,13 @@ def generate_panorama(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
         if cfg.save_outputs:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-        left_raw, right_raw = build_panoramas(video_path, cfg, stabilized=True, show_progress=True)
-        if left_raw is None or right_raw is None:
+        stereo = prepare_stereo_pair(video_path, cfg, stabilized=True, show_build_process=True)
+        if stereo is None:
             print("No panoramas produced.")
             continue
 
-        res = process_panorama_pair(
-            left_raw, right_raw,
+        res = analyze_cylindrical_pair(
+            stereo,
             out_dir=out_dir,
             tag="stabilized",
             cfg=cfg,
@@ -300,87 +483,51 @@ def generate_panorama(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
             save=cfg.save_outputs,
         )
 
-        # Print a compact summary (optional)
+        # Print a compact summary
         orb = res["report"]["orb"]
         m, M = summarize_row_band(res["report"]["row_band"])
-        print(f"[stabilized] vergence shift: {res['shift_px']}")
-        print(f"[stabilized row-band] mean|dy|={m:.2f}px  max|dy|={M:.2f}px")
-        print(f"[stabilized ORB] median|dy|={orb['median_abs_dy']:.2f}px  mean|dy|={orb['mean_abs_dy']:.2f}px  max|dy|={orb['max_abs_dy']:.2f}px")
+        print(f"[STABILIZED] vergence shift: {res['shift_px']}")
+        print(f"[STABILIZED row-band] mean|dy|={m:.2f}px  max|dy|={M:.2f}px")
+        print(f"[STABILIZED ORB] median|dy|={orb['median_abs_dy']:.2f}px  mean|dy|={orb['mean_abs_dy']:.2f}px  max|dy|={orb['max_abs_dy']:.2f}px")
 
-
-def build_panoramas(
-        video_path: str | Path,
-        cfg: PelegStereoConfig,
-        *,
-        stabilized: bool,
-        show_progress: bool,
-) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    if stabilized:
-        return run_prerecorded_video(video_path, cfg, show_progress=show_progress)
-    return run_prerecorded_video_raw(video_path, cfg, show_progress=show_progress)
-
-
-def process_panorama_pair(
-        left_raw: np.ndarray,
-        right_raw: np.ndarray,
-        *,
-        out_dir: Path | None,
-        tag: str,
-        cfg: PelegStereoConfig,
-        show: bool,
-        save: bool,
-) -> dict:
-    # (1) Vergence alignment
-    left, right, shift_px = align_and_crop_pair(left_raw, right_raw, max_shift=200)
-
-    # (2) Epipolar validation
-    report = run_epipolar_validation_report(left, right, band=4, max_shift=150, max_matches=200)
-
-    # (3) Optional overlays + match vis
-    show_and_save_epipolar_overlay(
-        left, right,
-        out_dir=out_dir if save else None,
-        prefix=tag,
-        num_lines=8,
-        display_scale=cfg.display_scale,
-        show=show,
-    )
-
-    match_vis = draw_top_matches_with_row_info(left, right, max_draw=10)
-    if show:
-        cv2.imshow(f"Top Matches ({tag})", resize_for_display(match_vis, cfg.display_scale))
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-    if save and out_dir is not None:
-        cv2.imwrite(str(out_dir / f"{tag}_left_raw.png"), left_raw)
-        cv2.imwrite(str(out_dir / f"{tag}_right_raw.png"), right_raw)
-        cv2.imwrite(str(out_dir / f"{tag}_left.png"), left)
-        cv2.imwrite(str(out_dir / f"{tag}_right.png"), right)
-        cv2.imwrite(str(out_dir / f"{tag}_orb_matches_dy.png"), match_vis)
-
-        show_and_save_anaglyph(
-            left, right,
-            output_path=out_dir / f"{tag}_anaglyph.png",
-            display_scale=cfg.display_scale,
-            show=show,
-        )
-
-    return {
-        "left": left,
-        "right": right,
-        "shift_px": shift_px,
-        "report": report,
-        "match_vis": match_vis,
-    }
-
+#
+# def main() -> None:
+#     VIDEO_PATHs = [
+#         # "recorded_video0.mov",
+#         "recorded_video1.mov",
+#     ]
+#
+#     cfg = PelegStereoConfig(
+#         strip_offset_px=120,
+#         strip_width_px=2,
+#         max_columns=None,
+#         display_scale=1,
+#         save_outputs=True,
+#     )
+#
+#     print("\nModes:")
+#     print("1 - Generate Panorama (stabilized)")
+#     print("2 - Compare Stabilization")
+#     print("3 - Planar viewer")
+#     print("q - Quit")
+#
+#     while True:
+#         key = input("\nSelect mode: ").strip().lower()
+#
+#         if key == "1":
+#             generate_panorama(VIDEO_PATHs, cfg)
+#         elif key == "2":
+#             compare_stabilization(VIDEO_PATHs, cfg)
+#         elif key == "3":
+#             show_planar_view(VIDEO_PATHs, cfg)
+#         elif key in ("q", "quit"):
+#             break
+#         cv2.destroyAllWindows()
 
 def main() -> None:
     VIDEO_PATHs = [
         "recorded_video0.mov",
         "recorded_video1.mov",
-        # "recorded_video2.mov",
-        # "recorded_video3.mov",
     ]
 
     cfg = PelegStereoConfig(
@@ -391,8 +538,41 @@ def main() -> None:
         save_outputs=True,
     )
 
-    generate_panorama(VIDEO_PATHs, cfg)
-    # compare_stablization(VIDEO_PATHs, cfg)
+    mode = "generate"  # "generate" | "compare" | "planar"
+
+    print(
+        "\nControls:\n"
+        "  1 = Generate Panorama (stabilized)\n"
+        "  2 = Compare Stabilization\n"
+        "  3 = Planar View\n"
+        "  q/ESC = quit\n"
+    )
+
+    while True:
+        if mode == "generate":
+            generate_panorama(VIDEO_PATHs, cfg)
+        elif mode == "compare":
+            compare_stabilization(VIDEO_PATHs, cfg)
+        elif mode == "planar":
+            show_planar_view(VIDEO_PATHs, cfg)
+
+
+        canvas = np.zeros((160, 520, 3), dtype=np.uint8)
+        cv2.putText(canvas, "Press 1/2/3 to switch mode, q to quit",
+                    (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.imshow("Mode Switch", canvas)
+
+        key = cv2.waitKey(0) & 0xFF
+        cv2.destroyAllWindows()
+
+        if key == 27 or key == ord("q"):
+            break
+        if key == ord("1"):
+            mode = "generate"
+        elif key == ord("2"):
+            mode = "compare"
+        elif key == ord("3"):
+            mode = "planar"
 
 
 if __name__ == "__main__":

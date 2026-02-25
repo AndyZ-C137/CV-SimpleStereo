@@ -241,9 +241,10 @@ def draw_top_matches_with_row_info(
         left_bgr: np.ndarray,
         right_bgr: np.ndarray,
         *,
-        max_draw: int = 12,
+        max_draw: int = 20,
         dy_thresh: float = 4.0,
         nfeatures: int = 1500,
+        min_y_sep: int = 30
 ) -> np.ndarray:
     """
     Draw top ORB matches between left/right panoramas and annotate dy values.
@@ -274,11 +275,22 @@ def draw_top_matches_with_row_info(
     matches = sorted(bf.match(dL, dR), key=lambda m: m.distance)
 
     good = []
+    used_ys: list[float] = []
     for m in matches:
         _, yL = kL[m.queryIdx].pt
         _, yR = kR[m.trainIdx].pt
-        if abs(yR - yL) <= dy_thresh:
-            good.append(m)
+
+        # Epipolar consistency filter
+        if abs(yR - yL) > dy_thresh:
+            continue
+
+        # Vertical spacing filter (use left y as reference)
+        if any(abs(yL - yy) < min_y_sep for yy in used_ys):
+            continue
+
+        good.append(m)
+        used_ys.append(yL)
+
         if len(good) >= max_draw:
             break
 
@@ -308,9 +320,10 @@ def draw_top_matches_with_row_info(
             f"dy={dy:+.1f}",
             (px, py),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.8,
             (0, 255, 255),
-            1,
+            # (255, 0, 0)
+            2,
             cv2.LINE_AA,
         )
 
@@ -353,5 +366,13 @@ def run_epipolar_validation_report(
     return {"row_band": row_band, "orb": orb_stats}
 
 
-
-
+def summarize_row_band(row_band: list[dict]) -> tuple[float, float]:
+    """
+    Given row_band = [{"y":..., "best_dy":..., "best_dx":...}, ...]
+    return:
+      mean_abs_dy, max_abs_dy
+    """
+    if not row_band:
+        return float("nan"), float("nan")
+    dys = np.array([float(r["best_dy"]) for r in row_band], dtype=np.float64)
+    return float(np.mean(np.abs(dys))), float(np.max(np.abs(dys)))

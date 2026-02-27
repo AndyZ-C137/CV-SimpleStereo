@@ -9,8 +9,8 @@ from stereocv.peleg import PelegStereoConfig, PelegStereo
 from stereocv.stabilize import StablePelegPipeline, StablePelegConfig
 
 from stereocv.stereo.vergence import align_and_crop_pair
-from stereocv.stereo.validation import run_epipolar_validation_report, draw_top_matches_with_row_info, \
-    summarize_row_band
+from stereocv.stereo.validation import run_epipolar_validation_report, \
+    summarize_row_band, draw_top_matches_with_row_info
 from stereocv.viz.visulization import (
     resize_for_display, show_and_save_anaglyph, show_and_save_epipolar_overlay,
     draw_status_text, make_side_by_side, make_anaglyph, render_planar_view_from_cylinder, draw_correspondence_arrows
@@ -81,6 +81,17 @@ def prepare_stereo_pair(
     )
 
 
+VALIDATION_CFG = dict(
+    # choose: "ours_translation" | "ours_affine" | "opencv_affine" | "none"
+    ransac_backend="ours_translation",
+    tau_px=3.0,
+    dy_gate=4,
+    max_iters=1500,
+    seed=0,
+    use_knn_ratio=False,
+    ratio=0.75,
+)
+
 def analyze_cylindrical_pair(
         stereo: PreparedStereo,
         *,
@@ -95,8 +106,17 @@ def analyze_cylindrical_pair(
     right = stereo.right
 
     # Epipolar validation
-    report = run_epipolar_validation_report(left, right, band=4, max_shift=150, max_matches=200)
+    report = run_epipolar_validation_report(
+        left, right,
+        band=4, max_shift=150, max_matches=200,
+        orb_kwargs=VALIDATION_CFG,
+    )
 
+    match_vis = draw_top_matches_with_row_info(
+        left, right,
+        max_draw=20,
+        **VALIDATION_CFG,
+    )
     # # Overlays + match visulization
     # show_and_save_epipolar_overlay(
     #     left, right,
@@ -107,8 +127,28 @@ def analyze_cylindrical_pair(
     #     show=show,
     # )
 
-    match_vis = draw_top_matches_with_row_info(left, right, max_draw=20)
+    orb = report["orb"]
+
+    lines = [
+        f"ORB raw: {int(orb['num_matches_raw'])}",
+        f"ORB used: {int(orb['num_matches_used'])}",
+        f"Inliers: {int(orb['num_inliers'])}",
+        f"median|dy|={orb['median_abs_dy']:.2f}px",
+        f"mean|dy|={orb['mean_abs_dy']:.2f}px",
+        f"max|dy|={orb['max_abs_dy']:.2f}px",
+    ]
+
+    m, M = summarize_row_band(report["row_band"])
+    lines.append(f"row mean|dy|={m:.2f}px")
+    lines.append(f"row max|dy|={M:.2f}px")
+
+    match_vis = draw_status_text(match_vis, lines)
+
     if show:
+        cv2.imshow("Left | Right Panorama",
+                   resize_for_display(make_side_by_side(left, right), cfg.display_scale))
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
         cv2.imshow(f"Top Matches ({tag})", resize_for_display(match_vis, cfg.display_scale))
         cv2.waitKey(0)
         cv2.destroyAllWindows()
@@ -237,7 +277,7 @@ def run_prerecorded_video(
             lines.append(f"corr_ty={stab.get('corr_ty', 0.0):+.2f}  corr_tx={stab.get('corr_tx', 0.0):+.2f}")
 
         # draw the debug lines on both frames
-        frame_vis = draw_status_text(frame, lines)
+        # frame_vis = draw_status_text(frame, lines)
         stable_vis = draw_status_text(stable_frame, lines)
 
         if show_progress:
@@ -310,45 +350,6 @@ def run_prerecorded_video_raw(
     cv2.destroyAllWindows()
     return left_pan, right_pan
 
-#
-# def show_planar_view(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
-#     cv2.destroyAllWindows()
-#     # Render planar perspective views
-#     yaw_deg = 0.0   # center look direction
-#     fov_deg = 60.0
-#     pano_fov_deg = 200
-#
-#     for i, video_path in enumerate(VIDEO_PATHs):
-#         stereo = prepare_stereo_pair(video_path, cfg, stabilized=True, show_build_process=False)
-#         if stereo is None:
-#             print("No panoramas produced.")
-#             continue
-#
-#         while True:
-#             Lp = render_planar_view_from_cylinder(
-#                 stereo.left, yaw_deg=yaw_deg, fov_deg=fov_deg,
-#                 panorama_fov_deg=pano_fov_deg, out_w=960,
-#             )
-#             Rp = render_planar_view_from_cylinder(
-#                 stereo.right, yaw_deg=yaw_deg, fov_deg=fov_deg,
-#                 panorama_fov_deg=pano_fov_deg, out_w=960,
-#             )
-#
-#             cv2.imshow("Planar Stereo (L|R)", resize_for_display(make_side_by_side(Lp, Rp), cfg.display_scale))
-#             # cv2.imshow("Planar Anaglyph", resize_for_display(make_anaglyph(Lp, Rp), cfg.display_scale))
-#
-#             key = cv2.waitKey(30) & 0xFF
-#             if key in (27, ord("q")):
-#                 cv2.destroyAllWindows()
-#                 break
-#             if key == ord("a"):
-#                 yaw_deg -= 2.0
-#             elif key == ord("d"):
-#                 yaw_deg += 2.0
-#             elif key == ord("w"):
-#                 fov_deg = min(100.0, fov_deg + 2.0)
-#             elif key == ord("s"):
-#                 fov_deg = max(20.0, fov_deg - 2.0)
 
 def show_planar_view(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
     # Close any lingering windows so key focus is clean
@@ -490,44 +491,10 @@ def generate_panorama(VIDEO_PATHs: list[str], cfg: PelegStereoConfig) -> None:
         print(f"[STABILIZED row-band] mean|dy|={m:.2f}px  max|dy|={M:.2f}px")
         print(f"[STABILIZED ORB] median|dy|={orb['median_abs_dy']:.2f}px  mean|dy|={orb['mean_abs_dy']:.2f}px  max|dy|={orb['max_abs_dy']:.2f}px")
 
-#
-# def main() -> None:
-#     VIDEO_PATHs = [
-#         # "recorded_video0.mov",
-#         "recorded_video1.mov",
-#     ]
-#
-#     cfg = PelegStereoConfig(
-#         strip_offset_px=120,
-#         strip_width_px=2,
-#         max_columns=None,
-#         display_scale=1,
-#         save_outputs=True,
-#     )
-#
-#     print("\nModes:")
-#     print("1 - Generate Panorama (stabilized)")
-#     print("2 - Compare Stabilization")
-#     print("3 - Planar viewer")
-#     print("q - Quit")
-#
-#     while True:
-#         key = input("\nSelect mode: ").strip().lower()
-#
-#         if key == "1":
-#             generate_panorama(VIDEO_PATHs, cfg)
-#         elif key == "2":
-#             compare_stabilization(VIDEO_PATHs, cfg)
-#         elif key == "3":
-#             show_planar_view(VIDEO_PATHs, cfg)
-#         elif key in ("q", "quit"):
-#             break
-#         cv2.destroyAllWindows()
-
 def main() -> None:
     VIDEO_PATHs = [
-        "recorded_video0.mov",
-        "recorded_video1.mov",
+        # "recorded_video0.mov",
+        "recorded_video.mov",
     ]
 
     cfg = PelegStereoConfig(
@@ -538,7 +505,7 @@ def main() -> None:
         save_outputs=True,
     )
 
-    mode = "generate"  # "generate" | "compare" | "planar"
+    mode = "generate"
 
     print(
         "\nControls:\n"

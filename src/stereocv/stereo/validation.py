@@ -29,7 +29,10 @@ This file provides two complementary validations:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Literal
+from ..ransac.core import ransac
+from ..ransac.translation_fitter import TranslationFitter
+from ..ransac.affine_fitter import AffineFitter
 
 import cv2
 import numpy as np
@@ -139,7 +142,7 @@ def estimate_row_disparity_shift(
 
     return best_dy, best_shift
 
-
+# (2) ORB match-based epipolar validation
 def  validate_epipolar_rows(
         left_bgr: np.ndarray,
         right_bgr: np.ndarray,
@@ -170,91 +173,219 @@ def  validate_epipolar_rows(
         out.append({"y": int(y), "best_dy": int(dy), "best_dx": int(dx)})
     return out
 
-
-# (2) ORB match-based epipolar validation
+RansacBackend = Optional[Literal["ours_translation", "ours_affine", "opencv_affine", "none"]]
 def validate_epipolar_with_orb_matches(
         left_bgr: np.ndarray,
         right_bgr: np.ndarray,
         *,
         max_matches: int = 200,
         nfeatures: int = 1500,
+        # matching constraints
+        dy_gate: float = 4.0,
+        use_knn_ratio: bool = False,
+        ratio: float = 0.75,
+        # RANSAC filtering
+        ransac_backend: RansacBackend = "our_translation",
+        tau_px: float = 3.0,
+        max_iters: int = 1500,
+        seed: int = 0,
 ) -> Dict[str, float]:
     """
-    Quantitatively validate epipolar constraint using sparse ORB feature matches.
+    ORB epipolar validation with optional RANSAC filtering.
 
-    Output stats focus on dy = y_right - y_left.
+    ransac_backend:
+      - "ours_translation": your core.ransac + TranslationFitter (min_samples=1)
+      - "ours_affine":      your core.ransac + AffineFitter (min_samples=3)
+      - "opencv_affine":    cv2.estimateAffinePartial2D(..., RANSAC)
+      - "none":             no RANSAC filtering
 
-    For good rectified/cylindrical stereo:
-      dy should be near 0 for correct matches.
-
-    Returns:
-      {
-        "num_matches": ...,
-        "median_abs_dy": ...,
-        "mean_abs_dy": ...,
-        "max_abs_dy": ...,
-      }
+    Returns stats on |dy| for matches after filtering.
+    Also reports inlier counts if RANSAC enabled.
     """
-    if left_bgr is None or right_bgr is None:
-        raise ValueError("validate_epipolar_with_orb_matches received None image(s).")
-    if left_bgr.size == 0 or right_bgr.size == 0:
+    if left_bgr is None or right_bgr is None or left_bgr.size == 0 or right_bgr.size == 0:
         raise ValueError("validate_epipolar_with_orb_matches received empty image(s).")
 
     Lg = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2GRAY)
     Rg = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2GRAY)
 
     orb = cv2.ORB_create(nfeatures=nfeatures)
-
     kL, dL = orb.detectAndCompute(Lg, None)
     kR, dR = orb.detectAndCompute(Rg, None)
 
     if dL is None or dR is None or len(kL) < 10 or len(kR) < 10:
         return {
-            "num_matches": 0.0,
+            "num_matches_raw": 0.0,
+            "num_matches_used": 0.0,
+            "num_inliers": 0.0,
             "median_abs_dy": float("nan"),
             "mean_abs_dy": float("nan"),
             "max_abs_dy": float("nan"),
         }
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(dL, dR)
+    # Matching: crossCheck OR KNN+ratio
+    if use_knn_ratio:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        knn = bf.knnMatch(dL, dR, k=2)
+        matches = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < ratio * n.distance:
+                matches.append(m)
+    else:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(dL, dR)
+
     matches = sorted(matches, key=lambda m: m.distance)[:max_matches]
+    num_raw = len(matches)
 
-    dys = []
-    for m in matches:
-        (_, yL) = kL[m.queryIdx].pt
-        (_, yR) = kR[m.trainIdx].pt
-        dys.append(float(yR - yL))
+    if num_raw == 0:
+        return {
+            "num_matches_raw": 0.0,
+            "num_matches_used": 0.0,
+            "num_inliers": 0.0,
+            "median_abs_dy": float("nan"),
+            "mean_abs_dy": float("nan"),
+            "max_abs_dy": float("nan"),
+        }
+    # Build correspondence arrays
+    ptsL = np.array([kL[m.queryIdx].pt for m in matches], dtype=np.float64)  # (N,2)
+    ptsR = np.array([kR[m.trainIdx].pt for m in matches], dtype=np.float64)  # (N,2)
 
-    dys = np.array(dys, dtype=np.float64)
-    abs_dy = np.abs(dys)
+    # Optional loose dy gate BEFORE RANSAC (improves robustness)
+    if dy_gate is not None and dy_gate > 0:
+        dy0 = ptsR[:, 1] - ptsL[:, 1]
+        keep0 = np.abs(dy0) <= float(dy_gate)
+        matches = [m for m, keep in zip(matches, keep0) if keep]
+        ptsL = ptsL[keep0]
+        ptsR = ptsR[keep0]
+
+    if len(matches) < 6:
+        # Not enough for robust stats; still compute dy stats if possible
+        if len(matches) == 0:
+            return {
+                "num_matches_raw": float(num_raw),
+                "num_matches_used": 0.0,
+                "num_inliers": 0.0,
+                "median_abs_dy": float("nan"),
+                "mean_abs_dy": float("nan"),
+                "max_abs_dy": float("nan"),
+            }
+        dy = ptsR[:, 1] - ptsL[:, 1]
+        abs_dy = np.abs(dy)
+        return {
+            "num_matches_raw": float(num_raw),
+            "num_matches_used": float(len(matches)),
+            "num_inliers": float(len(matches)),
+            "median_abs_dy": float(np.median(abs_dy)),
+            "mean_abs_dy": float(np.mean(abs_dy)),
+            "max_abs_dy": float(np.max(abs_dy)),
+        }
+    # RANSAC filter
+    inlier_mask = None
+
+    if ransac_backend in (None, "none"):
+        inlier_mask = np.ones((len(matches),), dtype=bool)
+
+    elif ransac_backend == "ours_translation":
+        fitter = TranslationFitter()
+        res = ransac(
+            model_fitter=fitter,
+            pts0=ptsL,
+            pts1=ptsR,
+            min_samples=1,
+            tau=tau_px,
+            max_iters=max_iters,
+            seed=seed,
+        )
+        if res is not None:
+            inlier_mask = res.inliers
+        else:
+            inlier_mask = np.ones((len(matches),), dtype=bool)  # fallback
+
+    elif ransac_backend == "ours_affine":
+        fitter = AffineFitter()
+        res = ransac(
+            model_fitter=fitter,
+            pts0=ptsL,
+            pts1=ptsR,
+            min_samples=3,
+            tau=tau_px,
+            max_iters=max_iters,
+            seed=seed,
+        )
+        if res is not None:
+            inlier_mask = res.inliers
+        else:
+            inlier_mask = np.ones((len(matches),), dtype=bool)
+
+    elif ransac_backend == "opencv_affine":
+        # OpenCV expects float32
+        M, inliers = cv2.estimateAffinePartial2D(
+            ptsL.astype(np.float32),
+            ptsR.astype(np.float32),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=float(tau_px),
+            maxIters=int(max_iters),
+            confidence=0.99,
+            refineIters=10,
+        )
+        if inliers is not None:
+            inlier_mask = inliers.ravel().astype(bool)
+        else:
+            inlier_mask = np.ones((len(matches),), dtype=bool)
+
+    else:
+        raise ValueError(f"Unknown ransac_backend: {ransac_backend}")
+
+    # Apply inliers
+    matches_in = [m for m, keep in zip(matches, inlier_mask) if keep]
+    ptsL_in = ptsL[inlier_mask]
+    ptsR_in = ptsR[inlier_mask]
+
+    if len(matches_in) == 0:
+        return {
+            "num_matches_raw": float(num_raw),
+            "num_matches_used": float(len(matches)),
+            "num_inliers": 0.0,
+            "median_abs_dy": float("nan"),
+            "mean_abs_dy": float("nan"),
+            "max_abs_dy": float("nan"),
+        }
+
+    dy = ptsR_in[:, 1] - ptsL_in[:, 1]
+    abs_dy = np.abs(dy)
 
     return {
-        "num_matches": float(len(matches)),
+        "num_matches_raw": float(num_raw),
+        "num_matches_used": float(len(matches)),
+        "num_inliers": float(len(matches_in)),
         "median_abs_dy": float(np.median(abs_dy)),
         "mean_abs_dy": float(np.mean(abs_dy)),
         "max_abs_dy": float(np.max(abs_dy)),
     }
-
 
 def draw_top_matches_with_row_info(
         left_bgr: np.ndarray,
         right_bgr: np.ndarray,
         *,
         max_draw: int = 20,
-        dy_thresh: float = 4.0,
+        dy_gate: float = 4.0,
         nfeatures: int = 1500,
-        min_y_sep: int = 30
+        min_y_sep: int = 30,
+        use_knn_ratio: bool = False,
+        ratio: float = 0.75,
+        # RANSAC options
+        ransac_backend: RansacBackend = "ours_translation",
+        tau_px: float = 3.0,
+        max_iters: int = 1500,
+        seed: int = 0,
 ) -> np.ndarray:
     """
-    Draw top ORB matches between left/right panoramas and annotate dy values.
-
-    Returns:
-      match_vis: image showing matches and dy labels.
+    Draw ORB matches with dy labels, with optional RANSAC match filtering.
     """
-    if left_bgr is None or right_bgr is None:
-        raise ValueError("draw_top_matches_with_row_info received None image(s).")
-    if left_bgr.size == 0 or right_bgr.size == 0:
+    if left_bgr is None or right_bgr is None or left_bgr.size == 0 or right_bgr.size == 0:
         raise ValueError("draw_top_matches_with_row_info received empty image(s).")
 
     Lg = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2GRAY)
@@ -265,64 +396,132 @@ def draw_top_matches_with_row_info(
     kR, dR = orb.detectAndCompute(Rg, None)
 
     if dL is None or dR is None:
-        # Fall back to side-by-side image if we can't compute matches
         h = min(left_bgr.shape[0], right_bgr.shape[0])
         w = min(left_bgr.shape[1], right_bgr.shape[1])
         return np.concatenate([left_bgr[:h, :w], right_bgr[:h, :w]], axis=1)
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    # Match
+    if use_knn_ratio:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        knn = bf.knnMatch(dL, dR, k=2)
+        matches = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < ratio * n.distance:
+                matches.append(m)
+    else:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(dL, dR)
 
-    matches = sorted(bf.match(dL, dR), key=lambda m: m.distance)
+    matches = sorted(matches, key=lambda m: m.distance)
 
+    # Build pts arrays
+    ptsL = np.array([kL[m.queryIdx].pt for m in matches], dtype=np.float64)
+    ptsR = np.array([kR[m.trainIdx].pt for m in matches], dtype=np.float64)
+
+    # dy gate BEFORE RANSAC (keeps things sane)
+    dy = ptsR[:, 1] - ptsL[:, 1]
+    keep_dy = np.abs(dy) <= float(max(dy_gate, tau_px))
+    matches = [m for m, keep in zip(matches, keep_dy) if keep]
+    ptsL = ptsL[keep_dy]
+    ptsR = ptsR[keep_dy]
+
+    if len(matches) == 0:
+        h = min(left_bgr.shape[0], right_bgr.shape[0])
+        w = min(left_bgr.shape[1], right_bgr.shape[1])
+        return np.concatenate([left_bgr[:h, :w], right_bgr[:h, :w]], axis=1)
+
+    # RANSAC filter
+    if ransac_backend not in (None, "none"):
+        inlier_mask = None
+
+        if ransac_backend == "ours_translation":
+            fitter = TranslationFitter()
+            res = ransac(
+                model_fitter=fitter,
+                pts0=ptsL,
+                pts1=ptsR,
+                min_samples=1,
+                tau=tau_px,
+                max_iters=max_iters,
+                seed=seed,
+            )
+            inlier_mask = res.inliers if res is not None else np.ones((len(matches),), dtype=bool)
+
+        elif ransac_backend == "ours_affine":
+            fitter = AffineFitter()
+            res = ransac(
+                model_fitter=fitter,
+                pts0=ptsL,
+                pts1=ptsR,
+                min_samples=3,
+                tau=tau_px,
+                max_iters=max_iters,
+                seed=seed,
+            )
+            inlier_mask = res.inliers if res is not None else np.ones((len(matches),), dtype=bool)
+
+        elif ransac_backend == "opencv_affine":
+            M, inliers = cv2.estimateAffinePartial2D(
+                ptsL.astype(np.float32),
+                ptsR.astype(np.float32),
+                method=cv2.RANSAC,
+                ransacReprojThreshold=float(tau_px),
+                maxIters=int(max_iters),
+                confidence=0.99,
+                refineIters=10,
+            )
+            inlier_mask = inliers.ravel().astype(bool) if inliers is not None else np.ones((len(matches),), dtype=bool)
+
+        else:
+            raise ValueError(f"Unknown ransac_backend: {ransac_backend}")
+
+        matches = [m for m, keep in zip(matches, inlier_mask) if keep]
+
+    # -------------------------
+    # Choose top matches to draw with spacing + dy constraint
+    # -------------------------
     good = []
     used_ys: list[float] = []
     for m in matches:
         _, yL = kL[m.queryIdx].pt
         _, yR = kR[m.trainIdx].pt
 
-        # Epipolar consistency filter
-        if abs(yR - yL) > dy_thresh:
+        if abs(yR - yL) > dy_gate:
             continue
-
-        # Vertical spacing filter (use left y as reference)
         if any(abs(yL - yy) < min_y_sep for yy in used_ys):
             continue
 
         good.append(m)
         used_ys.append(yL)
-
         if len(good) >= max_draw:
             break
 
-    matches = good
+    if not good:
+        good = matches[:max_draw]
 
     vis = cv2.drawMatches(
         left_bgr, kL,
         right_bgr, kR,
-        matches, None,
+        good, None,
         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
     )
 
-    # drawMatches places right image to the right; offset is left image width
-    wL = left_bgr.shape[1]
-
-    for m in matches:
+    # annotate dy
+    for m in good:
         xL, yL = kL[m.queryIdx].pt
         xR, yR = kR[m.trainIdx].pt
         dy = yR - yL
 
-        # Put label near the left keypoint
-        px = int(xL + 5)
-        py = int(yL - 5)
-
         cv2.putText(
             vis,
             f"dy={dy:+.1f}",
-            (px, py),
+            (int(xL + 5), int(yL - 5)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (0, 255, 255),
-            # (255, 0, 0)
             2,
             cv2.LINE_AA,
         )
@@ -330,7 +529,6 @@ def draw_top_matches_with_row_info(
     return vis
 
 
-# Convenience "report" helper
 def run_epipolar_validation_report(
         left_bgr: np.ndarray,
         right_bgr: np.ndarray,
@@ -339,28 +537,18 @@ def run_epipolar_validation_report(
         band: int = 4,
         max_shift: int = 150,
         max_matches: int = 200,
+        orb_kwargs: Optional[dict] = None,
 ) -> dict:
-    """
-    Run both row-band and ORB validations and return a combined report dict.
-
-    Returns:
-      {
-        "row_band": [ ... ],
-        "orb": { ... }
-      }
-    """
     row_band = validate_epipolar_rows(
-        left_bgr,
-        right_bgr,
-        rows=band_rows,
-        band=band,
-        max_shift=max_shift,
+        left_bgr, right_bgr,
+        rows=band_rows, band=band, max_shift=max_shift,
     )
 
+    orb_kwargs = orb_kwargs or {}
     orb_stats = validate_epipolar_with_orb_matches(
-        left_bgr,
-        right_bgr,
+        left_bgr, right_bgr,
         max_matches=max_matches,
+        **orb_kwargs,
     )
 
     return {"row_band": row_band, "orb": orb_stats}

@@ -270,7 +270,7 @@ def draw_status_text(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
                     (0, 0, 0), 3, cv2.LINE_AA)   # shadow
         cv2.putText(out, text, (x0, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (0, 255, 0), 2, cv2.LINE_AA)
+                    (0, 215, 255), 2, cv2.LINE_AA)
     return out
 
 
@@ -286,8 +286,8 @@ def render_planar_view_from_cylinder(
     """
     Render a rectilinear (pinhole) view from a cylindrical panorama.
 
-    our panoramas do NOT cover full 360 degrees.
-    So we must NOT assume u in [0,W) maps to theta in [0, 2*pi).
+    My panoramas do NOT cover full 360 degrees.
+    So we cannot assume u in [0,W) maps to theta in [0, 2*pi).
 
     Instead, assume the panorama covers `panorama_fov_deg` degrees total.
 
